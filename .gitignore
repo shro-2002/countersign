@@ -1,0 +1,19 @@
+# Secrets: never commit
+.env
+.env.*
+!.env.example
+
+# Raw sandbox API logs from early experiments (redacted evidence lives in evidence/)
+smoke/results/
+
+# Local tooling / build output
+.remember/
+.claude/
+__pycache__/
+*.pyc
+.pytest_cache/
+web/node_modules/
+web/.next/
+web/next-env.d.ts
+*.tsbuildinfo
+.DS_Store
