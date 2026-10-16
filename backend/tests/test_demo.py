@@ -67,3 +67,15 @@ def test_llm_cap_blocks_live_models_but_never_the_scripted_agent():
     demo.check_llm_cap("scripted:1.00", spent)
     with pytest.raises(demo.DemoLimit):
         demo.check_llm_cap("gemini:gemini-flash-lite-latest", spent)
+
+
+def test_reverify_is_closed_in_judge_mode(demo_client):
+    res = demo_client.post("/api/cases/00000000-0000-0000-0000-000000000000/verify",
+                           headers={"X-Countersign-Session": "a" * 32})
+    assert res.status_code == 403  # refused before any DB or PayPal access
+
+
+def test_provider_quota_becomes_an_actionable_429():
+    status, body = api.agent_error_response('LLM provider HTTP 429: [{"error": {"code": 429}}]')
+    assert (status, body["error"]["code"]) == (429, "QUOTA_EXHAUSTED") and "Scripted adversary" in body["error"]["message"]
+    assert api.agent_error_response("LLM provider HTTP 500: boom")[0] == 503

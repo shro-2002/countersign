@@ -1,56 +1,49 @@
 // Server-side proxy to the Countersign API. Attaches the operator token so it never reaches the browser.
-// Judge mode (COUNTERSIGN_DEMO_ACCESS_CODE set): visitors log in with the access code and get a signed, httpOnly
-// session cookie; the proxy forwards that session id so the backend isolates and caps each visitor's cases.
-import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+// Judge mode (COUNTERSIGN_DEMO_ACCESS_CODE set): visitors log in with the access code and get a signed, httpOnly,
+// server-expiring session cookie; the proxy forwards that session id so the backend isolates and caps each visitor.
 import { NextRequest, NextResponse } from "next/server";
 
-const API_URL = process.env.COUNTERSIGN_API_URL ?? "http://localhost:8000";
+import {
+  clientIp, codeMatches, isCrossOrigin, issueSession, LoginLimiter, MIN_ACCESS_CODE_LENGTH, MIN_SESSION_SECRET_LENGTH,
+  readSession, SESSION_HOURS,
+} from "@/lib/session";
+
 const ACCESS_CODE = process.env.COUNTERSIGN_DEMO_ACCESS_CODE;
 const SESSION_SECRET = process.env.COUNTERSIGN_SESSION_SECRET ?? "";
 const COOKIE = "cs_session";
-const SESSION_HOURS = 8;
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
-const LOGIN_MAX_ATTEMPTS = 10;
 const ALLOWED = /^(cases(\/[0-9a-f-]{36}(\/(mandate|agent|verify|tool-calls\/[0-9a-f-]{36}\/(approve-correction|reject)))?)?|health|seeds|evidence)$/;
 
-// ponytail: in-memory per-IP login limiter; fine for one instance, move to the DB if the web tier scales out
-const attempts = new Map<string, { count: number; since: number }>();
+// ponytail: in-memory limiter is per web instance; move it to the DB if the web tier ever runs more than one
+const limiter = new LoginLimiter(10, 200, LOGIN_WINDOW_MS);
 
 const json = (body: unknown, status: number) => NextResponse.json(body, { status });
-const digest = (s: string) => createHash("sha256").update(s).digest();
-const sign = (sid: string) => createHmac("sha256", SESSION_SECRET).update(sid).digest("hex");
 
-function sessionFrom(req: NextRequest): string | null {
-  const [sid, sig] = (req.cookies.get(COOKIE)?.value ?? "").split(".");
-  if (!sid || !sig || !/^[0-9a-f]{32}$/.test(sid)) return null;
-  const expected = Buffer.from(sign(sid));
-  const given = Buffer.from(sig);
-  return given.length === expected.length && timingSafeEqual(given, expected) ? sid : null;
+const RAW_API_URL = process.env.COUNTERSIGN_API_URL ?? "http://localhost:8000";
+const API_URL = RAW_API_URL.includes("://") ? RAW_API_URL : `http://${RAW_API_URL}`; // Render hostport has no scheme
+
+/** Judge mode refuses to run with a guessable code or a short signing secret (fail closed). */
+function judgeConfigError(): string | null {
+  if ((ACCESS_CODE ?? "").length < MIN_ACCESS_CODE_LENGTH) return `access code must be at least ${MIN_ACCESS_CODE_LENGTH} characters`;
+  if (SESSION_SECRET.length < MIN_SESSION_SECRET_LENGTH) return "COUNTERSIGN_SESSION_SECRET is missing or too short";
+  return null;
 }
 
-function tooManyAttempts(ip: string): boolean {
-  const now = Date.now();
-  const entry = attempts.get(ip);
-  if (!entry || now - entry.since > LOGIN_WINDOW_MS) {
-    attempts.set(ip, { count: 1, since: now });
-    return false;
-  }
-  entry.count += 1;
-  return entry.count > LOGIN_MAX_ATTEMPTS;
-}
+// Settings are fixed at startup, so check them once. Non-null means every judge-mode request fails closed.
+const JUDGE_CONFIG_ERROR = ACCESS_CODE ? judgeConfigError() : null;
+const misconfigured = () => json({ error: { message: `server misconfigured: ${JUDGE_CONFIG_ERROR}` } }, 500);
 
 async function login(req: NextRequest): Promise<NextResponse> {
   if (!ACCESS_CODE) return json({ error: { message: "judge mode is not enabled" } }, 404);
-  if (SESSION_SECRET.length < 32) return json({ error: { message: "server is missing COUNTERSIGN_SESSION_SECRET" } }, 500);
-  const ip = (req.headers.get("x-forwarded-for") ?? "local").split(",")[0].trim();
-  if (tooManyAttempts(ip)) return json({ error: { message: "too many attempts; try again in 15 minutes" } }, 429);
-  const { code } = (await req.json().catch(() => ({}))) as { code?: string };
-  if (typeof code !== "string" || !timingSafeEqual(digest(code), digest(ACCESS_CODE))) {
-    return json({ error: { message: "wrong access code" } }, 401);
+  if (JUDGE_CONFIG_ERROR) return misconfigured();
+  if (limiter.isLimited(clientIp(req.headers.get("x-forwarded-for")))) {
+    return json({ error: { message: "too many attempts; try again in 15 minutes" } }, 429);
   }
-  const sid = randomBytes(16).toString("hex");
+  const { code } = (await req.json().catch(() => ({}))) as { code?: unknown };
+  if (!codeMatches(code, ACCESS_CODE)) return json({ error: { message: "wrong access code" } }, 401);
+  const { cookie } = issueSession(SESSION_SECRET);
   const res = json({ ok: true }, 200);
-  res.cookies.set(COOKIE, `${sid}.${sign(sid)}`, {
+  res.cookies.set(COOKIE, cookie, {
     httpOnly: true, secure: process.env.NODE_ENV === "production", sameSite: "strict", path: "/",
     maxAge: SESSION_HOURS * 3600,
   });
@@ -58,6 +51,9 @@ async function login(req: NextRequest): Promise<NextResponse> {
 }
 
 async function forward(req: NextRequest, path: string[]): Promise<NextResponse> {
+  if (req.method === "POST" && isCrossOrigin(req.headers.get("origin"), req.headers.get("host"))) {
+    return json({ error: { message: "cross-origin request refused" } }, 403);
+  }
   const joined = path.join("/");
   if (joined === "session" && req.method === "POST") return login(req);
   const token = process.env.COUNTERSIGN_OPERATOR_TOKEN;
@@ -65,7 +61,8 @@ async function forward(req: NextRequest, path: string[]): Promise<NextResponse> 
   if (!token) return json({ error: { message: "server is missing COUNTERSIGN_OPERATOR_TOKEN" } }, 500);
   const headers: Record<string, string> = { "Content-Type": "application/json", Authorization: `Bearer ${token}` };
   if (ACCESS_CODE && joined !== "health") {
-    const sid = sessionFrom(req);
+    if (JUDGE_CONFIG_ERROR) return misconfigured();
+    const sid = readSession(req.cookies.get(COOKIE)?.value, SESSION_SECRET);
     if (!sid) return json({ error: { code: "LOGIN_REQUIRED", message: "enter the judge access code" } }, 401);
     headers["X-Countersign-Session"] = sid;
   }

@@ -65,12 +65,15 @@ Every `/api/cases*` endpoint requires `Authorization: Bearer $COUNTERSIGN_OPERAT
 
 ```bash
 cd backend
-python3 -m pytest -q                        # 67 offline tests: policy, money, claims, scoring, auth, timeouts, judge mode, eval accounting
-RUN_SANDBOX=1 python3 -m pytest -q          # + 11 sandbox tests (need sandbox credentials in .env, Postgres, network)
+python3 -m pytest -q                        # 69 offline tests: policy, money, claims, scoring, auth, timeouts, judge mode, eval accounting
+RUN_SANDBOX=1 python3 -m pytest -q          # + 13 sandbox tests (need sandbox credentials in .env, Postgres, network)
+(cd ../web && npm test)                     # 7 judge-session tests (expiry, tampering, login limiter, cross-origin)
 cd .. && python3 evals/run_frozen.py gemini:gemini-flash-lite-latest   # frozen 8-case eval: U / D / C (needs API running)
 python3 evals/summarize.py evals/results/<file>.jsonl                 # per-guard table; every run stays in the denominator
 python3 evals/export_traces.py evals/results/<file>.jsonl --pilot     # redacted traces + PayPal re-verification -> evidence/
 ```
+
+CI (`.github/workflows/ci.yml`) runs offline tests, `pip-audit`, typecheck, build, `npm audit` and Gitleaks on every push and pull request, with no secrets. Deployment: `render.yaml` plus [docs/HOSTING_PLAN.md](docs/HOSTING_PLAN.md). Demo video plan: [docs/DEMO_SCRIPT.md](docs/DEMO_SCRIPT.md).
 
 **Documents:**
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): how a request flows through the system

@@ -82,9 +82,21 @@ async def demo_limit(_: Request, exc: demo.DemoLimit):
     return JSONResponse(status_code=exc.status, content={"error": {"code": "DEMO_LIMIT", "message": str(exc)}})
 
 
+QUOTA_MESSAGE = ("The live model's free-tier quota is used up for now. Nothing was moved and this case can be retried. "
+                 "To finish the demo, choose 'Scripted adversary' (labelled, no LLM).")
+
+
+def agent_error_response(message: str) -> tuple[int, dict]:
+    """Provider quota (HTTP 429) gets a clear, actionable message; other agent failures stay 503."""
+    if "HTTP 429" in message:
+        return 429, {"error": {"code": "QUOTA_EXHAUSTED", "message": QUOTA_MESSAGE}}
+    return 503, {"error": {"code": "AGENT_UNAVAILABLE", "message": message}}
+
+
 @app.exception_handler(AgentError)
 async def agent_error(_: Request, exc: AgentError):
-    return JSONResponse(status_code=503, content={"error": {"code": "AGENT_UNAVAILABLE", "message": str(exc)}})
+    status, body = agent_error_response(str(exc))
+    return JSONResponse(status_code=status, content=body)
 
 
 def require_operator(authorization: str | None = Header(default=None)) -> None:
@@ -175,9 +187,11 @@ def create_case(body: CreateCase, session: str | None = Session):
                                         body.guard, seed=body.seed)
         return _jsonable(service().view(case_id))
     seed = demo.seed(body.seed or "")
-    demo.check_case_caps(service().demo_usage(session))
-    case_id = service().create_case(seed["operator_instruction"], seed["untrusted_message"], "1.00", "countersign",
-                                    session_id=session, seed=seed["id"])
+    # ponytail: one global lock makes both caps exact; demo creates are rare (<=60/day), so serializing them is fine
+    with db.case_lock(get_settings().db_url, "demo-create"):
+        demo.check_case_caps(service().demo_usage(session))
+        case_id = service().create_case(seed["operator_instruction"], seed["untrusted_message"], "1.00", "countersign",
+                                        session_id=session, seed=seed["id"])
     return _jsonable(service().view(case_id))
 
 
@@ -219,6 +233,8 @@ def reject(case_id: uuid.UUID, tool_call_id: uuid.UUID, session: str | None = Se
 
 @app.post("/api/cases/{case_id}/verify", dependencies=OPERATOR)
 def verify(case_id: uuid.UUID, session: str | None = Session):
+    if session is not None:  # every step already verifies; an open re-verify would let visitors spam PayPal reads
+        raise demo.DemoLimit(403, "verification runs automatically in judge mode")
     cid = owned(case_id, session)
     service().verify(cid)
     return _jsonable(service().view(cid))

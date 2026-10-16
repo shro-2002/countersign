@@ -82,8 +82,11 @@ class Countersign:
     # ---------- agent ----------
     def run_agent(self, case_id: str, model: str) -> None:
         case = self._case(case_id)
-        if case["status"] != "MANDATE_CONFIRMED":
-            raise CaseError(f"agent runs once, after mandate confirmation (status {case['status']})")
+        with db.connect(self.s.db_url) as conn:  # atomic claim: concurrent or replayed requests cannot start a 2nd run
+            claimed = conn.execute("UPDATE cases SET status='AGENT_RUNNING', updated_at=now() WHERE id=%s AND"
+                                   " status='MANDATE_CONFIRMED' RETURNING id", (case_id,)).fetchone()
+        if not claimed:
+            raise CaseError(f"agent runs once, after mandate confirmation (status {self._case(case_id)['status']})")
         task = (f"{case['operator_instruction']}\n\nCase context (from the PayPal record): order {case['order_id']}, "
                 f"capture_id {case['capture_id']}, captured {fmt(case['capture_amount'])} {case['currency'].strip()}.")
         ctx = agent_mod.AgentContext(
@@ -106,9 +109,13 @@ class Countersign:
 
     def _agent_failed(self, case_id: str, error: str) -> None:
         """No tool call yet: the case stays retryable. Otherwise verify now, which records PayPal state and moves the
-        case out of MANDATE_CONFIRMED so a half-finished run cannot be started again on the same mandate."""
+        case to a final status so a half-finished run cannot be started again on the same mandate."""
+        # ponytail: a process crash mid-run leaves the case in AGENT_RUNNING; an operator must close it by hand
         proposed = bool(self.tool_calls(case_id))
-        self._event(case_id, "agent_failed", {"error": error[:500], "retryable": not proposed})
+        with db.connect(self.s.db_url) as conn:
+            db.add_event(conn, case_id, "agent_failed", {"error": error[:500], "retryable": not proposed})
+            if not proposed:
+                conn.execute("UPDATE cases SET status='MANDATE_CONFIRMED', updated_at=now() WHERE id=%s", (case_id,))
         if proposed:
             self.verify(case_id)
 

@@ -3,7 +3,7 @@
 CREATE TABLE IF NOT EXISTS cases (
     id                  uuid PRIMARY KEY,
     status              text NOT NULL CHECK (status IN (
-                            'FUNDED', 'MANDATE_CONFIRMED', 'AGENT_COMPLETE', 'AWAITING_APPROVAL',
+                            'FUNDED', 'MANDATE_CONFIRMED', 'AGENT_RUNNING', 'AGENT_COMPLETE', 'AWAITING_APPROVAL',
                             'EXECUTING', 'VERIFIED', 'VERIFICATION_FAILED', 'FAILED')),
     operator_instruction text NOT NULL,
     untrusted_message   text NOT NULL,          -- attacker-controllable; never used for authorization
@@ -69,3 +69,9 @@ ALTER TABLE cases ADD COLUMN IF NOT EXISTS session_id text;
 ALTER TABLE cases ADD COLUMN IF NOT EXISTS seed text;
 CREATE INDEX IF NOT EXISTS idx_cases_session_id ON cases(session_id);
 CREATE INDEX IF NOT EXISTS idx_cases_created_at ON cases(created_at);
+
+-- AGENT_RUNNING: the one request that claimed the agent run (existing databases get the widened status list).
+ALTER TABLE cases DROP CONSTRAINT IF EXISTS cases_status_check;
+ALTER TABLE cases ADD CONSTRAINT cases_status_check CHECK (status IN (
+    'FUNDED', 'MANDATE_CONFIRMED', 'AGENT_RUNNING', 'AGENT_COMPLETE', 'AWAITING_APPROVAL',
+    'EXECUTING', 'VERIFIED', 'VERIFICATION_FAILED', 'FAILED'));
