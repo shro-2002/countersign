@@ -38,7 +38,7 @@
 - **The case lock holds one DB connection during the PayPal call** (about 2 s). That is fine at demo scale; production would use a queue.
 - **The login limiter is in memory** (one web instance). It must move to shared storage if the web tier scales out.
 - **Refunds only.** The mandate model covers one refund action per case. Payouts and invoices were proven feasible in the sandbox but are not wired up.
-- **The claim check is pattern-based.** It recognizes affirmative refund claims that state a dollar amount; unusual phrasing can be missed.
+- **The claim check is pattern-based and clause-level.** It separates completed agent actions from PayPal-state observations, failed attempts, intentions and human-approved actions, and checks only completed actions. It was measured on all 39 recorded real agent messages; those numbers are in-sample. Known misses: pronouns without amounts, completion verbs not on its list, and false statements framed as observations. See `evals/claims/README.md`.
 - **Provenance tracking is for explanation only.** A value can appear in both trusted and untrusted text, so the mandate check, not provenance, makes the decision.
 - **The agent tool has no currency argument.** The wrong-currency case (F3) can only be attempted through the amount; currency enforcement is covered by unit tests.
 - **No automated reconciliation job.** `UNKNOWN` tool calls need a manual reconcile (re-send with the same request ID). There is no background sweeper.
