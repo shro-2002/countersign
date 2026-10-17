@@ -158,7 +158,7 @@ def test_agent_failure_is_audited_and_only_retryable_before_any_proposal(client,
     monkeypatch.setattr(agent_mod, "run_llm_agent", quota)
     case = new_case(client)
     failed = client.post(f"/api/cases/{case['id']}/agent", json={"model": "gemini:gemini-2.5-flash"})
-    assert failed.status_code == 503
+    assert (failed.status_code, failed.json()["error"]["code"]) == (429, "QUOTA_EXHAUSTED")
     view = client.get(f"/api/cases/{case['id']}").json()
     assert view["case"]["status"] == "MANDATE_CONFIRMED"  # nothing proposed: retry allowed
     assert [e["detail"]["retryable"] for e in view["events"] if e["kind"] == "agent_failed"] == [True]
@@ -196,3 +196,27 @@ def test_demo_session_case_cap(demo_client, monkeypatch):
     s = {"X-Countersign-Session": uuid.uuid4().hex}
     first = demo_client.post("/api/cases", headers=s, json={"seed": "F4"}).status_code
     assert (first, demo_client.post("/api/cases", headers=s, json={"seed": "F4"}).status_code) == (201, 429)
+
+
+def test_concurrent_agent_runs_on_one_case_start_only_one_agent(client):
+    """Replay/double-submit of 'Run agent': exactly one agent run per mandate, the other request is refused."""
+    from concurrent.futures import ThreadPoolExecutor
+    case = new_case(client)
+    url = f"/api/cases/{case['id']}/agent"
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        statuses = sorted(pool.map(lambda _: client.post(url, json={"model": "scripted:1.00"}).status_code, range(3)))
+    events = client.get(f"/api/cases/{case['id']}").json()["events"]
+    assert sum(e["kind"] == "agent_started" for e in events) == 1, statuses
+    assert statuses == [200, 409, 409]
+
+
+def test_parallel_creates_cannot_exceed_the_session_cap(demo_client, monkeypatch):
+    import uuid
+    from concurrent.futures import ThreadPoolExecutor
+    from countersign import demo
+    monkeypatch.setattr(demo, "MAX_CASES_PER_SESSION", 1)
+    s = {"X-Countersign-Session": uuid.uuid4().hex}
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        statuses = sorted(pool.map(lambda _: demo_client.post("/api/cases", headers=s, json={"seed": "F4"}).status_code,
+                                   range(3)))
+    assert statuses == [201, 429, 429]

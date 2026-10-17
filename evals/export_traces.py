@@ -4,6 +4,7 @@
   Gate B pilot runs: the logged PayPal responses from smoke/results (scripted and LLM)
 Each run's order is re-read from PayPal now; the manifest records whether today's PayPal state still matches the
 reported excess. Usage: python3 evals/export_traces.py evals/results/<frozen>.jsonl [--pilot]
+                  or:  python3 evals/export_traces.py --case <case_id> [--set console-2026-10-17]  (appends one run)
 Needs ../.env (sandbox credentials, DB). Writes evidence/<set>/*.json and evidence/manifest.json.
 """
 
@@ -44,6 +45,33 @@ def write(rel: str, bundle: dict) -> tuple[str, str]:
     return rel, hashlib.sha256(text.encode()).hexdigest()
 
 
+def case_records(case_id: str) -> tuple[dict, list[dict], list[dict]]:
+    """The console's full audit record for one case: case row, tool calls (verdicts, PayPal responses), events."""
+    with db.connect(get_settings().db_url) as conn:
+        case = conn.execute("SELECT * FROM cases WHERE id=%s", (case_id,)).fetchone()
+        calls = conn.execute("SELECT * FROM tool_calls WHERE case_id=%s ORDER BY seq", (case_id,)).fetchall()
+        events = conn.execute("SELECT ts, kind, detail FROM events WHERE case_id=%s ORDER BY id", (case_id,)).fetchall()
+    if not case:
+        raise SystemExit(f"case {case_id} not found")
+    return case, calls, events
+
+
+def export_console(case_id: str, set_name: str, pp: PayPalSandbox) -> dict:
+    """One live console case (operator-driven, not a frozen-eval row), with a fresh PayPal re-read."""
+    case, calls, events = case_records(case_id)
+    check = reverify(pp, case["order_id"], case["capture_id"], case["mandate"]["amount"], str(case["capture_amount"]))
+    v = case["verification"] or {}
+    rel, sha = write(f"{set_name}/{case_id}.json", {
+        "description": "PayPal SANDBOX live console case (operator-driven). Synthetic data, simulated USD. Redacted.",
+        "case": case, "tool_calls": calls, "events": events, "paypal_reverified_at_export": check})
+    return {"set": set_name, "run": case_id, "case_id": case_id, "agent": case["agent_model"],
+            "agent_kind": "SCRIPTED" if str(case["agent_model"]).startswith("scripted") else "LLM",
+            "reported_outcome": v.get("outcome"), "reported_excess": v.get("excess_unauthorized_amount"),
+            "order_id": case["order_id"], "capture_id": case["capture_id"], "trace": rel, "sha256": sha,
+            "paypal_reverified": check,
+            "reverified_matches_report": check["excess_unauthorized_amount"] == v.get("excess_unauthorized_amount")}
+
+
 def export_frozen(results: Path, pp: PayPalSandbox) -> list[dict]:
     cases = {c["id"]: c for c in json.loads((ROOT / "evals/frozen/refund_cases.json").read_text())["cases"]}
     entries = []
@@ -58,11 +86,7 @@ def export_frozen(results: Path, pp: PayPalSandbox) -> list[dict]:
         if "case_id" not in r:
             entries.append({**entry, "trace": None, "paypal_reverified": None})
             continue
-        with db.connect(get_settings().db_url) as conn:
-            case = conn.execute("SELECT * FROM cases WHERE id=%s", (r["case_id"],)).fetchone()
-            calls = conn.execute("SELECT * FROM tool_calls WHERE case_id=%s ORDER BY seq", (r["case_id"],)).fetchall()
-            events = conn.execute("SELECT ts, kind, detail FROM events WHERE case_id=%s ORDER BY id",
-                                  (r["case_id"],)).fetchall()
+        case, calls, events = case_records(r["case_id"])
         check = reverify(pp, case["order_id"], case["capture_id"], case["mandate"]["amount"], str(case["capture_amount"]))
         rel, sha = write(f"frozen-2026-10-16/{entry['run']}.json", {
             "description": "PayPal SANDBOX frozen-eval run. Synthetic data, simulated USD. Redacted.",
@@ -106,10 +130,20 @@ def export_pilot(pp: PayPalSandbox) -> list[dict]:
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("results", type=Path)
+    p.add_argument("results", type=Path, nargs="?")
     p.add_argument("--pilot", action="store_true", help="also export Gate B pilot runs from smoke/results")
+    p.add_argument("--case", help="append ONE live console case to the manifest (historical entries untouched)")
+    p.add_argument("--set", default="console", help="evidence folder for --case")
     args = p.parse_args()
     pp = PayPalSandbox(get_settings())
+    if args.case:
+        manifest = json.loads((EVIDENCE / "manifest.json").read_text())
+        entry = export_console(args.case, args.set, pp)
+        manifest["runs"] = [r for r in manifest["runs"] if r.get("run") != entry["run"]] + [entry]
+        (EVIDENCE / "manifest.json").write_text(json.dumps(manifest, indent=2, default=str) + "\n")
+        print(entry["run"], entry["agent"], entry["reported_outcome"], "match" if entry["reverified_matches_report"]
+              else "MISMATCH")
+        return
     entries = export_frozen(args.results, pp) + (export_pilot(pp) if args.pilot else [])
     (EVIDENCE / "manifest.json").write_text(json.dumps({
         "note": "Every reported run -> redacted trace file (sha256) -> PayPal sandbox state re-read at export time.",

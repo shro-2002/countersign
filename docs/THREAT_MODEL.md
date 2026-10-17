@@ -28,6 +28,9 @@
 | T12 | Operator approval races the agent's own in-mandate refund (both read "$0 refunded" and both execute) | Per-case Postgres advisory lock around authorize->execute; mandate use = max(PayPal COMPLETED+PENDING refunds, local EXECUTING/SUCCEEDED/UNKNOWN ledger) | Sandbox: reproduced $0.50 against a $0.25 mandate (1 of 3) before the fix; 6 of 6 clean after |
 | T13 | Public visitors abuse the hosted demo (free-text attacks on our key, unbounded cases, reading other visitors' cases) | Judge mode: access code + signed httpOnly session; seeded cases only; per-session isolation (404); caps per session and per day plus a daily LLM-run cap; allow-listed agents | Unit (`test_demo.py`) + sandbox (isolation, cap) |
 | T14 | Agent run fails mid-way and is started again on the same mandate | An `agent_failed` audit event; if any tool call happened, the case is verified and leaves `MANDATE_CONFIRMED`, so it cannot be re-run | Sandbox (quota-429 path) |
+| T15 | Replayed or concurrent "Run agent" starts several agent runs on one mandate (double LLM spend, competing proposals) | Atomic claim `MANDATE_CONFIRMED → AGENT_RUNNING`; losers get 409 | Sandbox: reproduced 3 runs on one case before the fix; 1 after |
+| T16 | Parallel case creation bypasses the judge-mode caps | Cap check and insert under one advisory lock | Sandbox: reproduced 3 cases against a cap of 1 before the fix; exact after |
+| T17 | Stolen or copied judge cookie used indefinitely; access-code brute force with rotating spoofed addresses | Signed issue time, so the server enforces an 8 h expiry; per-address limit (rightmost XFF hop) plus a global login cap; minimum 12-character code; cross-origin POSTs refused | `web/lib/session.test.ts` (7 tests) + curl against the proxy |
 
 ## Known limitations (stated, not hidden)
 
@@ -35,7 +38,7 @@
 - **The case lock holds one DB connection during the PayPal call** (about 2 s). That is fine at demo scale; production would use a queue.
 - **The login limiter is in memory** (one web instance). It must move to shared storage if the web tier scales out.
 - **Refunds only.** The mandate model covers one refund action per case. Payouts and invoices were proven feasible in the sandbox but are not wired up.
-- **The claim check is pattern-based.** It recognizes affirmative refund claims that state a dollar amount; unusual phrasing can be missed.
+- **The claim check is pattern-based and clause-level.** It separates completed agent actions from PayPal-state observations, failed attempts, intentions and human-approved actions, and checks only completed actions. It was measured on all 39 recorded real agent messages; those numbers are in-sample. Known misses: pronouns without amounts, completion verbs not on its list, and false statements framed as observations. See `evals/claims/README.md`.
 - **Provenance tracking is for explanation only.** A value can appear in both trusted and untrusted text, so the mandate check, not provenance, makes the decision.
 - **The agent tool has no currency argument.** The wrong-currency case (F3) can only be attempted through the amount; currency enforcement is covered by unit tests.
 - **No automated reconciliation job.** `UNKNOWN` tool calls need a manual reconcile (re-send with the same request ID). There is no background sweeper.

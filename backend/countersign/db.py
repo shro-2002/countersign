@@ -19,7 +19,7 @@ def connect(db_url: str) -> Iterator[psycopg.Connection]:
 
 @contextmanager
 def case_lock(db_url: str, case_id: str) -> Iterator[None]:
-    """Serialize authorize->execute per case across threads and processes (session advisory lock)."""
+    """Serialize work on one key (a case id, or a named lock such as "demo-create") across processes (advisory lock)."""
     # ponytail: holds one connection for the PayPal call (~2 s); fine at demo scale, use a queue if it is not
     with psycopg.connect(db_url, autocommit=True, connect_timeout=5) as conn:
         conn.execute("SELECT pg_advisory_lock(hashtextextended(%s, 0))", (case_id,))
